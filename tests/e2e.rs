@@ -21,7 +21,7 @@ fn run_pipeline(input_path: PathBuf) -> String {
     let mut accounts = engine.repository().accounts().unwrap();
     // Sort so tests can compare bytes without depending on HashMap iteration
     // order. The spec says output order does not matter.
-    accounts.sort_by_key(|a| a.client_id);
+    accounts.sort_by_key(|a| a.client_id());
     let mut buf = Vec::new();
     write_accounts(&mut buf, &accounts).expect("write_accounts failed");
     String::from_utf8(buf).expect("utf8")

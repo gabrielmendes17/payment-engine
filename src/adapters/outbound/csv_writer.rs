@@ -28,11 +28,11 @@ struct AccountRow {
 impl AccountRow {
     fn from_account(a: &Account) -> Self {
         Self {
-            client: a.client_id,
-            available: format_amount(a.available),
-            held: format_amount(a.held),
+            client: a.client_id(),
+            available: format_amount(a.available()),
+            held: format_amount(a.held()),
             total: format_amount(a.total()),
-            locked: a.locked,
+            locked: a.is_locked(),
         }
     }
 }
@@ -58,6 +58,8 @@ pub fn write_accounts<W: Write>(writer: W, accounts: &[Account]) -> Result<(), :
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::DepositRecord;
+    use crate::domain::services::dispute_service;
     use rust_decimal_macros::dec;
 
     fn parse_output(bytes: &[u8]) -> Vec<Vec<String>> {
@@ -69,22 +71,28 @@ mod tests {
             .collect()
     }
 
+    fn credited(client: u16, amount: Decimal) -> Account {
+        Account::new(client).credit(amount).unwrap()
+    }
+
+    // Builds an account with `available = -amount` and `held = 0` and `locked = true`
+    // by running through deposit -> withdrawal -> dispute -> chargeback.
+    // Mirrors the end-to-end scenario in specs/05-acceptance-scenarios.md.
+    fn chargeback_locked_negative(client: u16, deposited: Decimal, withdrawn: Decimal) -> Account {
+        let account = Account::new(client)
+            .credit(deposited)
+            .unwrap()
+            .debit(withdrawn)
+            .unwrap();
+        let deposit = DepositRecord::new_applied(1, client, deposited);
+        let (account, deposit) = dispute_service::apply_dispute(account, deposit).unwrap();
+        let (account, _) = dispute_service::apply_chargeback(account, deposit).unwrap();
+        account
+    }
+
     #[test]
     fn writes_header_and_account_rows_with_four_decimal_precision() {
-        let accounts = vec![
-            Account {
-                client_id: 1,
-                available: dec!(1.5),
-                held: Decimal::ZERO,
-                locked: false,
-            },
-            Account {
-                client_id: 2,
-                available: dec!(2),
-                held: Decimal::ZERO,
-                locked: false,
-            },
-        ];
+        let accounts = vec![credited(1, dec!(1.5)), credited(2, dec!(2))];
         let mut buf = Vec::new();
         write_accounts(&mut buf, &accounts).unwrap();
         let rows = parse_output(&buf);
@@ -98,31 +106,26 @@ mod tests {
 
     #[test]
     fn preserves_negative_available_and_locked_flag() {
-        // Matches the end-to-end scenario in specs/05-acceptance-scenarios.md
-        let accounts = vec![Account {
-            client_id: 1,
-            available: dec!(-30),
-            held: Decimal::ZERO,
-            locked: true,
-        }];
+        // Deposit 100, withdraw 70 (available=30), dispute+chargeback the
+        // original 100 -> available=-70, held=0, locked=true, total=-70.
+        // Matches the shape of the end-to-end fixture.
+        let account = chargeback_locked_negative(1, dec!(100), dec!(70));
         let mut buf = Vec::new();
-        write_accounts(&mut buf, &accounts).unwrap();
+        write_accounts(&mut buf, &[account]).unwrap();
         let rows = parse_output(&buf);
-        assert_eq!(rows[1], vec!["1", "-30.0000", "0.0000", "-30.0000", "true"]);
+        assert_eq!(rows[1], vec!["1", "-70.0000", "0.0000", "-70.0000", "true"]);
     }
 
     #[test]
     fn held_and_total_are_derived_consistently() {
-        let accounts = vec![Account {
-            client_id: 5,
-            available: dec!(-7),
-            held: dec!(10),
-            locked: false,
-        }];
+        // Fund 3, then dispute a 10-value synthetic deposit -> available=-7,
+        // held=10, total=3.
+        let account = Account::new(5).credit(dec!(3)).unwrap();
+        let deposit = DepositRecord::new_applied(1, 5, dec!(10));
+        let (account, _) = dispute_service::apply_dispute(account, deposit).unwrap();
         let mut buf = Vec::new();
-        write_accounts(&mut buf, &accounts).unwrap();
+        write_accounts(&mut buf, &[account]).unwrap();
         let rows = parse_output(&buf);
-        // total = available + held
         assert_eq!(rows[1], vec!["5", "-7.0000", "10.0000", "3.0000", "false"]);
     }
 

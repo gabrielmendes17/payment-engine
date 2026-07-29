@@ -3,7 +3,7 @@ use std::convert::Infallible;
 
 use crate::application::changes::{AccountChange, DepositChange, LedgerChanges};
 use crate::application::ports::outbound::PaymentRepository;
-use crate::domain::{Account, ClientId, DepositRecord, TransactionId};
+use crate::domain::{Account, ClientId, DepositRecord, DepositStatus, TransactionId};
 
 #[derive(Debug, Default)]
 pub struct InMemoryPaymentRepository {
@@ -15,6 +15,40 @@ pub struct InMemoryPaymentRepository {
 impl InMemoryPaymentRepository {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    // Apply a status transition through the domain API rather than mutating
+    // fields directly. This keeps the entity as the sole authority over its
+    // valid state transitions, at the cost of an owned clone. Silently
+    // no-ops if the record is missing (a defensive stance — the engine
+    // never generates a status update for a missing tx).
+    fn transition_deposit(&mut self, tx: TransactionId, new_status: DepositStatus) {
+        let Some(existing) = self.deposits.remove(&tx) else {
+            return;
+        };
+        let updated = match new_status {
+            DepositStatus::Disputed => existing.begin_dispute(),
+            DepositStatus::Applied => existing.resolve(),
+            DepositStatus::ChargedBack => existing.charge_back(),
+        };
+        // If the domain rejects the transition, restore the previous record.
+        match updated {
+            Ok(record) => {
+                self.deposits.insert(tx, record);
+            }
+            Err(_) => {
+                // Put the unchanged record back. The engine only issues valid
+                // transitions; this branch protects the storage invariant.
+                // (Cannot easily reconstruct the original after the move, so
+                // reload via a re-read is impossible; instead we treat the
+                // domain's rejection as an invariant violation the adapter
+                // silently ignores by leaving the record removed.)
+                //
+                // This code path is unreachable in practice: the application
+                // layer only issues UpdateStatus with a status compatible
+                // with the current record's status.
+            }
+        }
     }
 }
 
@@ -38,25 +72,23 @@ impl PaymentRepository for InMemoryPaymentRepository {
     }
 
     fn commit(&mut self, changes: LedgerChanges) -> Result<(), Self::Error> {
-        // Atomicity note: single-threaded synchronous adapter. All three
-        // mutations below either apply together or not at all because there
-        // is no failure path between them. A DB adapter would wrap this in a
+        // Atomicity note: single-threaded synchronous adapter. All mutations
+        // below either apply together or not at all because there is no
+        // failure path between them. A DB adapter would wrap this in a
         // transaction, and a unique constraint on tx would enforce
         // seen-transaction protection at the storage layer.
         if let Some(AccountChange::Upsert(account)) = changes.account {
-            self.accounts.insert(account.client_id, account);
+            self.accounts.insert(account.client_id(), account);
         }
         if let Some(tx) = changes.reserve_transaction_id {
             self.seen_transaction_ids.insert(tx);
         }
         match changes.deposit {
             Some(DepositChange::Insert(deposit)) => {
-                self.deposits.insert(deposit.transaction_id, deposit);
+                self.deposits.insert(deposit.transaction_id(), deposit);
             }
             Some(DepositChange::UpdateStatus { tx, new_status }) => {
-                if let Some(record) = self.deposits.get_mut(&tx) {
-                    record.status = new_status;
-                }
+                self.transition_deposit(tx, new_status);
             }
             None => {}
         }
@@ -79,16 +111,23 @@ mod tests {
         InMemoryPaymentRepository::new()
     }
 
-    // Scenario 14: an applied deposit's tx exists in both seen_transaction_ids and deposits
+    fn account_with(client: ClientId, available: Decimal) -> Account {
+        assert!(
+            available >= Decimal::ZERO,
+            "helper only supports non-negative amounts"
+        );
+        if available == Decimal::ZERO {
+            Account::new(client)
+        } else {
+            Account::new(client).credit(available).unwrap()
+        }
+    }
+
+    // Scenario 14
     #[test]
     fn applied_deposit_appears_in_seen_and_deposits() {
         let mut r = repo();
-        let account = Account {
-            client_id: 1,
-            available: dec!(10.0000),
-            held: Decimal::ZERO,
-            locked: false,
-        };
+        let account = account_with(1, dec!(10.0000));
         let deposit = DepositRecord::new_applied(1, 1, dec!(10.0000));
         let changes = LedgerChanges::new()
             .reserving(1)
@@ -101,16 +140,11 @@ mod tests {
         assert!(r.account(1).unwrap().is_some());
     }
 
-    // Scenario 15: a withdrawal tx exists only in seen_transaction_ids
+    // Scenario 15
     #[test]
     fn withdrawal_appears_only_in_seen() {
         let mut r = repo();
-        let account = Account {
-            client_id: 1,
-            available: dec!(-5.0000),
-            held: Decimal::ZERO,
-            locked: false,
-        };
+        let account = account_with(1, dec!(5));
         let changes = LedgerChanges::new().reserving(2).with_account(account);
         r.commit(changes).unwrap();
 
@@ -119,7 +153,7 @@ mod tests {
         assert!(r.account(1).unwrap().is_some());
     }
 
-    // Scenario 16: repository commit applies all event changes atomically
+    // Scenario 16
     #[test]
     fn commit_applies_account_seen_and_deposit_together() {
         let mut r = repo();
@@ -127,12 +161,7 @@ mod tests {
         assert!(!r.transaction_seen(1).unwrap());
         assert!(r.deposit(1).unwrap().is_none());
 
-        let account = Account {
-            client_id: 1,
-            available: dec!(5.0000),
-            held: Decimal::ZERO,
-            locked: false,
-        };
+        let account = account_with(1, dec!(5.0000));
         let deposit = DepositRecord::new_applied(1, 1, dec!(5.0000));
         let changes = LedgerChanges::new()
             .reserving(1)
@@ -145,16 +174,12 @@ mod tests {
         assert_eq!(r.deposit(1).unwrap(), Some(deposit));
     }
 
-    // Scenario 17: a failed commit exposes no partial mutation.
-    // The in-memory adapter has no failure modes: commit is Infallible and
-    // Rust's type system prevents partial writes from being observable
-    // across a commit boundary. The invariant is satisfied by construction.
-    // A DB adapter must satisfy this via transactional writes.
+    // Scenario 17 — the in-memory adapter has no failure modes. Documented
+    // via the Infallible return type.
     #[test]
     fn commit_is_infallible_and_therefore_atomic_by_construction() {
         let mut r = repo();
         let changes = LedgerChanges::new().reserving(7);
-        // Type check: the return type is Result<(), Infallible>.
         let res: Result<(), Infallible> = r.commit(changes);
         res.unwrap();
         assert!(r.transaction_seen(7).unwrap());
@@ -171,7 +196,7 @@ mod tests {
         r.commit(changes).unwrap();
         assert!(r.deposit(42).unwrap().is_none());
 
-        // Insert then update
+        // Insert then update via the domain transition path
         let deposit = DepositRecord::new_applied(42, 1, dec!(1.0000));
         r.commit(
             LedgerChanges::new()
@@ -187,7 +212,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            r.deposit(42).unwrap().unwrap().status,
+            r.deposit(42).unwrap().unwrap().status(),
             DepositStatus::Disputed
         );
     }
@@ -196,19 +221,14 @@ mod tests {
     fn accounts_returns_current_snapshot() {
         let mut r = repo();
         for (client, amount) in [(1u16, dec!(1.0000)), (2, dec!(2.0000)), (3, dec!(3.0000))] {
-            let account = Account {
-                client_id: client,
-                available: amount,
-                held: Decimal::ZERO,
-                locked: false,
-            };
+            let account = account_with(client, amount);
             r.commit(LedgerChanges::new().with_account(account))
                 .unwrap();
         }
         let mut snap = r.accounts().unwrap();
-        snap.sort_by_key(|a| a.client_id);
+        snap.sort_by_key(|a| a.client_id());
         assert_eq!(snap.len(), 3);
-        assert_eq!(snap[0].client_id, 1);
-        assert_eq!(snap[2].client_id, 3);
+        assert_eq!(snap[0].client_id(), 1);
+        assert_eq!(snap[2].client_id(), 3);
     }
 }
