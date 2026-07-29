@@ -9,3 +9,6 @@ csv = "1"
 rust_decimal = { version = "1", features = ["serde-with-str"] }
 thiserror = "1"
 anyhow = "1"
+
+[dev-dependencies]
+rust_decimal_macros = "1"
