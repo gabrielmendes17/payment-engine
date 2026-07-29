@@ -1,0 +1,17 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE — JetBrains
+/.idea/
+
+# IDE — VS Code
+/.vscode/
+
+# macOS
+.DS_Store
+
+# Environment
+.env
+.env.*
