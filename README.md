@@ -49,12 +49,12 @@ adapters/inbound   ──▶  application::ports::inbound::{ProcessTransaction, 
   `services::dispute_service` coordinates dispute-lifecycle
   operations that touch both `Account` and `Deposit`.
 - **`application/`** — thin use cases per transaction type + the
-  `PaymentEngine` dispatcher. Kept private at the crate root; only
+  `PaymentEngine` dispatcher. Kept private at the crate root; the
   caller-facing types (`PaymentEngine`, inbound ports, `EngineError`,
-  `ApplyOutcome`, `RejectionReason`) are publicly re-exported.
-  Outbound persistence details (`LedgerRepository`, `LedgerChanges`)
-  remain crate-visible so any additional repository adapter must live
-  inside this crate.
+  `ApplyOutcome`, `RejectionReason`, `LedgerRepository`,
+  `LedgerChanges`) are publicly re-exported. External adapters
+  implement `LedgerRepository` and destructure committed change-sets
+  through `LedgerChanges::into_parts()`.
 - **`adapters/inbound/`** — CSV parser and driver
   (`parse_rows`, `process_transactions`).
 - **`adapters/outbound/`** — in-memory `LedgerRepository` and CSV writer.
@@ -69,9 +69,10 @@ decision is stated so a reviewer can audit it directly.
 - **Reservation on rejection (`tx` is a one-shot identifier)**: a
   rejected deposit or withdrawal (invalid amount, locked account,
   insufficient funds) still reserves its `tx` so the number can never be
-  replayed later, applied or otherwise. Rationale: `tx` is a partner-
-  supplied identity; treating it as consumable regardless of outcome
-  makes replay attacks impossible and audit reconciliation exact.
+  replayed later, applied or otherwise. This prevents a rejected primary
+  transaction ID from being reused within the same processing run. Durable
+  idempotency across process restarts would require a persistent
+  transaction store or a database uniqueness constraint on `tx`.
 - **Duplicate transaction IDs**: once a `tx` has been reserved by any
   prior deposit or withdrawal (applied or rejected), a later deposit or
   withdrawal that reuses it is rejected with `DuplicateTransaction`.
@@ -106,9 +107,11 @@ decision is stated so a reviewer can audit it directly.
 - **Domain errors** (`AccountError`, `DepositError`, `DisputeError`) are
   narrow — each names only the invariants its owning entity is responsible
   for. They implement `std::error::Error` via `thiserror`.
-- **Application errors** (`RejectionReason`) are cross-cutting: they carry
-  the union of domain errors plus repository-wide concerns
-  (`DuplicateTransaction`, `DepositNotFound`). The application layer maps
+- **Business rejection outcomes** (`RejectionReason`) are cross-cutting:
+  they carry the union of domain errors plus repository-wide concerns
+  (`DuplicateTransaction`, `DepositNotFound`). They live inside
+  `Ok(ApplyOutcome::Rejected(_))`, not `Err`, because a rejected
+  transaction is a normal business event. The application layer maps
   domain errors into `RejectionReason` at the use-case boundary.
 - **Engine errors** (`EngineError<E>`) wrap repository failures with their
   concrete `E` so callers can downcast or match. `E` is required to be
@@ -168,11 +171,11 @@ cargo test --all-targets --all-features
 
 ## Known trade-offs
 
-- **In-memory only**: the in-memory repository uses two `HashMap`s
-  and one `HashSet`. The outbound port (`LedgerRepository` /
-  `LedgerChanges`) is `pub(crate)` by design — any additional
-  repository adapter should live inside this crate so it can inspect
-  the change-set. See the "Concurrent DB adapter" note below.
+- **In-memory only**: the reference adapter is
+  `InMemoryLedgerRepository`, backed by two `HashMap`s and one
+  `HashSet`. The outbound `LedgerRepository` port is public, so
+  additional adapters (e.g. a database) can be implemented outside
+  this crate. See the "Concurrent DB adapter" note below.
 - **Row ordering is unspecified**, as allowed by the challenge.
   Accounts are stored in a `HashMap` for amortized O(1) access. If
   deterministic output becomes necessary, the account snapshot can be

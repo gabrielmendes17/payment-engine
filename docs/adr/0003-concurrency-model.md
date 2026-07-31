@@ -21,10 +21,8 @@ Process rows sequentially in one thread. Do not introduce a channel between the 
 
 Reasoning:
 
-- CSV parsing and one application call are both on the order of microseconds.
-- A bounded MPSC channel adds an allocation and an atomic per row, plus a park or unpark round-trip.
+- Introducing a channel would add synchronization, buffering, and scheduling overhead without providing useful parallelism for the current ordered single-stream workload.
 - Naively processing rows concurrently would violate per-stream ordering. Safe parallelization would require partitioning by `client_id` and keeping each partition sequential (see "Across many streams" below); it is unnecessary for the current single-stream scope.
-- The dominant cost is I/O, addressed by `BufReader` capacity, not by a channel.
 
 The CSV adapter exposes an internal `process_transactions` helper that consumes any `IntoIterator<Item = Result<Transaction, CsvInputError>>`. This keeps the door open for a channel-fed source later without committing to a public source port now.
 

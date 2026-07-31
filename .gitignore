@@ -12,6 +12,7 @@ Cargo.lock.bak
 # macOS
 .DS_Store
 __MACOSX/
+._*
 
 # Environment
 .env
