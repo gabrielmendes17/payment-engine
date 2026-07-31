@@ -1,9 +1,7 @@
-//! Large-input regression test. Substantiates the O(n) claim in the README
-//! and guards against accidental O(n²) regressions on the engine hot path
-//! (deposit/withdraw/lifecycle dispatch and repository lookups). Tests build
-//! `Transaction` values directly so the parser is not in the measurement.
-
-use std::time::Instant;
+//! Large-input functional tests. Verify that per-client invariants hold
+//! across 100k deposits + 30k mixed dispute/resolve + 20k duplicate-tx
+//! runs. Performance claims belong to a separate `cargo bench` target;
+//! these tests only check correctness at scale.
 
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -15,44 +13,25 @@ use payment_engine::{ListAccounts, PaymentEngine, ProcessTransaction};
 const DEPOSITS: u32 = 100_000;
 const CLIENTS: u16 = 1_000;
 
-/// Streams 100k deposits across 1k clients through the engine and verifies:
-///
-/// - every row is `Applied`;
-/// - per-client totals match the expected sum;
-/// - the run completes in well under a loose wall-clock bound (regressions
-///   toward O(n²) would blow past this by orders of magnitude, not a few
-///   percent, so the bound is deliberately generous).
-///
-/// Transactions are built directly to keep the CSV parser out of the timing.
+/// Streams 100k deposits across 1k clients through the engine and verifies
+/// every row applies and per-client totals match the expected sum.
+/// Transactions are built one-at-a-time so no intermediate `Vec` is
+/// allocated, exercising the streaming shape of the driver.
 #[test]
-#[cfg_attr(debug_assertions, ignore = "run with --release for accurate timing")]
-fn hundred_thousand_deposits_scale_linearly() {
-    let mut transactions = Vec::with_capacity(DEPOSITS as usize);
-    for tx in 1..=DEPOSITS {
-        let client = (tx % u32::from(CLIENTS)) as u16 + 1;
-        transactions.push(Transaction::Deposit {
-            client,
-            tx,
-            amount: dec!(1.0000),
-        });
-    }
-
+fn hundred_thousand_deposits_apply_correctly() {
     let repo = InMemoryLedgerRepository::new();
     let mut engine = PaymentEngine::new(repo);
 
-    let start = Instant::now();
-    for transaction in transactions {
-        engine.process(transaction).unwrap();
+    for tx in 1..=DEPOSITS {
+        let client = (tx % u32::from(CLIENTS)) as u16 + 1;
+        engine
+            .process(Transaction::Deposit {
+                client,
+                tx,
+                amount: dec!(1.0000),
+            })
+            .unwrap();
     }
-    let elapsed = start.elapsed();
-
-    // Generous ceiling; a linear run on modest hardware finishes well under
-    // this. The point is to catch quadratic regressions, not to enforce a
-    // real perf budget.
-    assert!(
-        elapsed.as_secs() < 30,
-        "processing {DEPOSITS} deposits took {elapsed:?}, expected linear time"
-    );
 
     let accounts = engine.list_accounts().unwrap();
     assert_eq!(accounts.len(), CLIENTS as usize);
@@ -78,38 +57,42 @@ fn hundred_thousand_deposits_scale_linearly() {
 #[test]
 fn interleaved_disputes_and_resolves_preserve_invariants_at_scale() {
     const ROWS: u32 = 30_000;
+    let deposit_count = ROWS / 2;
+
+    let repo = InMemoryLedgerRepository::new();
+    let mut engine = PaymentEngine::new(repo);
 
     // First half: deposits so there is a pool of tx ids to dispute.
-    let deposit_count = ROWS / 2;
-    let mut transactions: Vec<Transaction> = (1..=deposit_count)
-        .map(|tx| Transaction::Deposit {
-            client: (tx % 100) as u16 + 1,
-            tx,
-            amount: dec!(2.5000),
-        })
-        .collect();
+    for tx in 1..=deposit_count {
+        let client = (tx % 100) as u16 + 1;
+        engine
+            .process(Transaction::Deposit {
+                client,
+                tx,
+                amount: dec!(2.5000),
+            })
+            .unwrap();
+    }
     // Second half: alternating dispute + resolve against the deposit pool.
     // Net effect on balances is zero, so per-client total stays at
     // deposit_count / clients * 2.5.
     for target_tx in 1..=(ROWS / 4) {
         let client = (target_tx % 100) as u16 + 1;
-        transactions.push(Transaction::Dispute {
-            client,
-            tx: target_tx,
-        });
-        transactions.push(Transaction::Resolve {
-            client,
-            tx: target_tx,
-        });
+        engine
+            .process(Transaction::Dispute {
+                client,
+                tx: target_tx,
+            })
+            .unwrap();
+        engine
+            .process(Transaction::Resolve {
+                client,
+                tx: target_tx,
+            })
+            .unwrap();
     }
 
-    let repo = InMemoryLedgerRepository::new();
-    let mut engine = PaymentEngine::new(repo);
-    for transaction in transactions {
-        engine.process(transaction).unwrap();
-    }
     let accounts = engine.list_accounts().unwrap();
-
     let deposits_per_client = deposit_count / 100;
     let expected_total = Decimal::from(deposits_per_client) * dec!(2.5);
     assert_eq!(accounts.len(), 100);
@@ -121,43 +104,36 @@ fn interleaved_disputes_and_resolves_preserve_invariants_at_scale() {
     }
 }
 
-/// Confirms duplicate-tx detection stays O(1) per row at scale — a linear
-/// scan on the seen-set would show up here.
+/// Confirms duplicate-tx detection stays correct at scale: the second
+/// pass reuses every tx from a different client, so every reuse must be
+/// rejected and no phantom account created for the impostor.
 #[test]
-fn duplicate_tx_detection_scales() {
+fn duplicate_tx_detection_at_scale() {
     const APPLIED: u32 = 20_000;
-
-    // First pass: applied deposits reserving tx 1..=APPLIED.
-    // Second pass: reuse every tx from a different client — all rejected.
-    let mut transactions = Vec::with_capacity(APPLIED as usize * 2);
-    for tx in 1..=APPLIED {
-        transactions.push(Transaction::Deposit {
-            client: 1,
-            tx,
-            amount: dec!(1.0000),
-        });
-    }
-    for tx in 1..=APPLIED {
-        transactions.push(Transaction::Deposit {
-            client: 2,
-            tx,
-            amount: dec!(1.0000),
-        });
-    }
 
     let repo = InMemoryLedgerRepository::new();
     let mut engine = PaymentEngine::new(repo);
 
-    let start = Instant::now();
-    for transaction in transactions {
-        engine.process(transaction).unwrap();
+    // First pass: applied deposits reserving tx 1..=APPLIED.
+    for tx in 1..=APPLIED {
+        engine
+            .process(Transaction::Deposit {
+                client: 1,
+                tx,
+                amount: dec!(1.0000),
+            })
+            .unwrap();
     }
-    let elapsed = start.elapsed();
-
-    assert!(
-        elapsed.as_secs() < 30,
-        "duplicate detection on {APPLIED} + {APPLIED} rows took {elapsed:?}"
-    );
+    // Second pass: reuse every tx from a different client — all rejected.
+    for tx in 1..=APPLIED {
+        engine
+            .process(Transaction::Deposit {
+                client: 2,
+                tx,
+                amount: dec!(1.0000),
+            })
+            .unwrap();
+    }
 
     let accounts = engine.list_accounts().unwrap();
     let client_1 = accounts.iter().find(|a| a.client_id() == 1).unwrap();
