@@ -69,11 +69,10 @@ decision is stated so a reviewer can audit it directly.
 
 - **Reservation on rejection (`tx` is a one-shot identifier)**: a
   rejected deposit or withdrawal (invalid amount, locked account,
-  insufficient funds) still reserves its `tx` so the number can never be
-  replayed later, applied or otherwise. This prevents a rejected primary
-  transaction ID from being reused within the same processing run. Durable
-  idempotency across process restarts would require a persistent
-  transaction store or a database uniqueness constraint on `tx`.
+  insufficient funds) still reserves its `tx` so the number cannot be
+  reused later within the same processing run. Durable idempotency
+  across process restarts would require a persistent transaction store
+  or a database uniqueness constraint on `tx`.
 - **Duplicate transaction IDs**: once a `tx` has been reserved by any
   prior deposit or withdrawal (applied or rejected), a later deposit or
   withdrawal that reuses it is rejected with `DuplicateTransaction`.
