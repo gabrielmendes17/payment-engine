@@ -1,13 +1,13 @@
 //! Payment engine library.
 //!
-//! The outbound `LedgerRepository` port is effectively sealed: `LedgerChanges`
-//! has `pub(crate)` fields, so any additional repository adapter should live
-//! inside this crate.
+//! Outbound persistence is a public port (`LedgerRepository`). External
+//! adapters consume a committed change-set via [`LedgerChanges::into_parts`].
 
 pub mod adapters;
 mod application;
 pub mod domain;
 
 pub use application::{
-    ApplyOutcome, EngineError, ListAccounts, PaymentEngine, ProcessTransaction, RejectionReason,
+    ApplyOutcome, EngineError, LedgerChanges, LedgerRepository, ListAccounts, PaymentEngine,
+    ProcessTransaction, RejectionReason,
 };

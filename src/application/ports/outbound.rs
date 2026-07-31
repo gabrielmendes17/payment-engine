@@ -1,8 +1,13 @@
 use crate::application::changes::LedgerChanges;
 use crate::domain::{Account, ClientId, Deposit, TransactionId};
 
-/// Effectively sealed: `LedgerChanges` has `pub(crate)` fields, so a
-/// foreign implementor could not inspect the change-set it receives.
+/// Outbound port implemented by ledger adapters.
+///
+/// Adapters back the four read operations (`transaction_seen`,
+/// `account`, `deposit`, `accounts`) with their storage of choice and
+/// persist a committed change-set by destructuring it via
+/// [`LedgerChanges::into_parts`]. See `InMemoryLedgerRepository` for the
+/// reference in-memory adapter.
 pub trait LedgerRepository {
     type Error: std::error::Error + Send + Sync + 'static;
 

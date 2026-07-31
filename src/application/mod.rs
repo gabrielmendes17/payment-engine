@@ -6,7 +6,9 @@ pub(crate) mod payment_engine;
 pub(crate) mod ports;
 pub(crate) mod use_cases;
 
+pub use changes::LedgerChanges;
 pub use errors::EngineError;
 pub use outcome::{ApplyOutcome, RejectionReason};
 pub use payment_engine::PaymentEngine;
 pub use ports::inbound::{ListAccounts, ProcessTransaction};
+pub use ports::outbound::LedgerRepository;
