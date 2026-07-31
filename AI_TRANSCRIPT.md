@@ -33,11 +33,11 @@ _Started 2026-07-29 02:09 UTC._
 
 ### User
 
-lets review this specs and check against the challenge here ~/Downloads/Rust Coding Challenge.pdf
+lets review this specs and check against the challenge here ~/Downloads/<take-home>.pdf
 
 ### User
 
-lets review this specs and check against the challenge here ~/Downloads/Rust Coding Challenge.pdf
+lets review this specs and check against the challenge here ~/Downloads/<take-home>.pdf
 
 ### User
 
@@ -77,11 +77,11 @@ lets review this specs and check against the challenge here ~/Downloads/Rust Cod
 
 ### User
 
-lets review the specs on this directory against this challenge document: ~/Downloads/Rust Coding Challenge.pdf
+lets review the specs on this directory against this challenge document: ~/Downloads/<take-home>.pdf
 
 > **Ran (Bash)** — `ls -la .` — List directory contents
 
-> **Read** — `~/Downloads/Rust Coding Challenge.pdf`
+> **Read** — `~/Downloads/<take-home>.pdf`
 
 > **Ran (Bash)** — `find . -type f | head -50 && echo "---" && ls -la specs docs` — List all files in project
 
