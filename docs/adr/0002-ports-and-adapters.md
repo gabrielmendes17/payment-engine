@@ -9,15 +9,25 @@ Accepted
 Use a lightweight ports-and-adapters architecture in one Cargo crate.
 
 ```text
-Inbound port:   ProcessTransaction
-Outbound port:  PaymentRepository
-Inbound adapter: CSV reader
+Inbound port:   ProcessTransaction, ListAccounts (both public)
+Outbound port:  LedgerRepository (public trait, effectively sealed —
+                LedgerChanges has pub(crate) fields so no out-of-crate
+                implementer can inspect the change-set it would receive)
+                type Error: std::error::Error + Send + Sync + 'static
+Inbound adapter:  CSV reader
 Outbound adapter: In-memory repository
 ```
 
 The CSV file reader is an adapter, not a port.
 
-The repository port exposes an atomic commit operation so a future database adapter can persist a complete ledger change in one transaction.
+The trait itself is `pub` because it appears as a public generic
+bound on `PaymentEngine`, but it takes a `LedgerChanges` value whose
+fields are `pub(crate)`: an out-of-crate implementer would receive a
+change-set it cannot inspect, so any additional repository adapter
+must live inside this crate. The port still exposes an
+atomic commit operation so a future in-crate database adapter can
+persist a complete ledger change in one transaction — see ADR 0003 for
+the atomicity caveat.
 
 ## Consequences
 

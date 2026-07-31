@@ -2,6 +2,15 @@
 name = "payment-engine"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+
+[lib]
+name = "payment_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "payment-engine"
+path = "src/main.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

@@ -11,7 +11,16 @@ Cargo.lock.bak
 
 # macOS
 .DS_Store
+__MACOSX/
 
 # Environment
 .env
 .env.*
+
+# Local archives / submission bundles
+*.zip
+*.patch
+
+# Local run artifacts
+/accounts.csv
+/transactions.csv

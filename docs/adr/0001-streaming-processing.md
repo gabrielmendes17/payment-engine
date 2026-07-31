@@ -13,7 +13,7 @@ The in-memory repository maintains:
 ```text
 accounts: HashMap<ClientId, Account>
 seen_transaction_ids: HashSet<TransactionId>
-deposits: HashMap<TransactionId, DepositRecord>
+deposits: HashMap<TransactionId, Deposit>
 ```
 
 Only deposits retain full transaction details because only deposits participate in the dispute lifecycle.
@@ -32,7 +32,7 @@ Negative:
 
 - deposit IDs occur in both the seen-ID set and deposit map;
 - the seen-ID set grows with every primary transaction;
-- processing is not parallelized.
+- processing is single-threaded for the single-stream scope; multi-stream parallelization is addressed in ADR 0003.
 
 The duplicated deposit key is accepted because the set and map have different responsibilities.
 
@@ -41,4 +41,4 @@ The duplicated deposit key is accepted because the set and map have different re
 - Storing every primary transaction was rejected as unnecessary memory use.
 - Storing only deposits was rejected because duplicate withdrawals would not be detected.
 - A deposit map plus withdrawal-only set was rejected because duplicate checks would span two collections.
-- Parallel workers were rejected because the required input is one ordered stream.
+- Parallel workers within a single stream were rejected because rows are chronologically ordered and each transaction may depend on earlier state. Sharding by `client_id` across multiple streams is out of scope here — see ADR 0003.
