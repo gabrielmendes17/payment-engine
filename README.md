@@ -182,6 +182,13 @@ cargo test --all-targets --all-features
   sorted by `client` at the serialization boundary without changing
   the repository structure. Consumers must key by `client`, not row
   index.
+- **Async / concurrent evolutions**: several patterns for scaling
+  beyond a single stream (single-owner MPSC, client-sharded workers,
+  replicated scans, pre-sharded files, per-client actors) were
+  considered but not implemented. See
+  `docs/adr/0004-asynchronous-evolution.md` for the catalog and
+  trade-offs, and `docs/adr/0003-concurrency-model.md` for the two
+  recommended postures.
 - **Concurrent DB adapter would need port changes**: today the engine
   reads `transaction_seen` and then commits in two steps. Under
   concurrency, that split races: a unique-constraint conflict would

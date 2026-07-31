@@ -35,6 +35,8 @@ Two composable patterns are allowed at the composition root:
 - One engine per stream when clients do not cross streams. Each `PaymentEngine` owns its `InMemoryLedgerRepository`. No shared state.
 - A router in front of N engines, sharded by `client_id`, when clients can appear on any stream. The router uses one MPSC per shard. Each shard remains internally sequential. This preserves per-client ordering while giving N-way parallelism across clients.
 
+See ADR 0004 for the wider option space (replicated scans, pre-sharded files, per-client actors) and why the two patterns above were preferred.
+
 ### Shared storage
 
 The current port is sufficient for sequential in-memory processing. Replacing the in-memory adapter with a database-backed `LedgerRepository` would preserve `commit` atomicity, and a unique constraint on `tx` would provide duplicate protection at the storage layer.
