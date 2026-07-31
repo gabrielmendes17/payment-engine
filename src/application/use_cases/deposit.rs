@@ -2,7 +2,7 @@ use rust_decimal::Decimal;
 
 use crate::application::changes::LedgerChanges;
 use crate::application::errors::EngineError;
-use crate::application::helpers::load_or_new_account;
+use crate::application::helpers::{classify_account_error, load_or_new_account};
 use crate::application::outcome::{ApplyOutcome, RejectionReason};
 use crate::application::ports::outbound::LedgerRepository;
 use crate::domain::{ClientId, Deposit, TransactionId};
@@ -46,11 +46,12 @@ where
                 .map_err(EngineError::Repository)?;
             Ok(ApplyOutcome::Applied)
         }
-        Err(reason) => {
+        Err(err) => {
+            let reason = classify_account_error(err)?;
             repository
                 .commit(LedgerChanges::new(account).reserving(tx))
                 .map_err(EngineError::Repository)?;
-            Ok(ApplyOutcome::Rejected(reason.into()))
+            Ok(ApplyOutcome::Rejected(reason))
         }
     }
 }

@@ -13,6 +13,8 @@ pub enum AccountError {
     InsufficientFunds { client: ClientId },
     #[error("insufficient held funds for client {client}")]
     InsufficientHeldFunds { client: ClientId },
+    #[error("balance arithmetic overflow for client {client}")]
+    ArithmeticOverflow { client: ClientId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

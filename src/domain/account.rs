@@ -64,10 +64,32 @@ impl Account {
         }
     }
 
+    fn overflow(&self) -> AccountError {
+        AccountError::ArithmeticOverflow {
+            client: self.client_id,
+        }
+    }
+
+    fn ensure_total_representable(
+        &self,
+        available: Decimal,
+        held: Decimal,
+    ) -> Result<(), AccountError> {
+        available
+            .checked_add(held)
+            .map(|_| ())
+            .ok_or_else(|| self.overflow())
+    }
+
     pub fn credit(mut self, amount: Decimal) -> Result<Self, AccountError> {
         Self::ensure_positive(amount)?;
         self.ensure_unlocked()?;
-        self.available += amount;
+        let new_available = self
+            .available
+            .checked_add(amount)
+            .ok_or_else(|| self.overflow())?;
+        self.ensure_total_representable(new_available, self.held)?;
+        self.available = new_available;
         Ok(self)
     }
 
@@ -79,17 +101,31 @@ impl Account {
                 client: self.client_id,
             });
         }
-        self.available -= amount;
+        let new_available = self
+            .available
+            .checked_sub(amount)
+            .ok_or_else(|| self.overflow())?;
+        self.ensure_total_representable(new_available, self.held)?;
+        self.available = new_available;
         Ok(self)
     }
 
-    /// May take `available` negative if the client has already spent the
-    /// disputed funds; `total = available + held` is preserved.
     pub(crate) fn hold(mut self, amount: Decimal) -> Result<Self, AccountError> {
         Self::ensure_positive(amount)?;
         self.ensure_unlocked()?;
-        self.available -= amount;
-        self.held += amount;
+        // A dispute may make available funds negative when the deposited
+        // funds have already been spent.
+        let new_available = self
+            .available
+            .checked_sub(amount)
+            .ok_or_else(|| self.overflow())?;
+        let new_held = self
+            .held
+            .checked_add(amount)
+            .ok_or_else(|| self.overflow())?;
+        self.ensure_total_representable(new_available, new_held)?;
+        self.available = new_available;
+        self.held = new_held;
         Ok(self)
     }
 
@@ -101,8 +137,17 @@ impl Account {
                 client: self.client_id,
             });
         }
-        self.available += amount;
-        self.held -= amount;
+        let new_available = self
+            .available
+            .checked_add(amount)
+            .ok_or_else(|| self.overflow())?;
+        let new_held = self
+            .held
+            .checked_sub(amount)
+            .ok_or_else(|| self.overflow())?;
+        self.ensure_total_representable(new_available, new_held)?;
+        self.available = new_available;
+        self.held = new_held;
         Ok(self)
     }
 
@@ -114,7 +159,12 @@ impl Account {
                 client: self.client_id,
             });
         }
-        self.held -= amount;
+        let new_held = self
+            .held
+            .checked_sub(amount)
+            .ok_or_else(|| self.overflow())?;
+        self.ensure_total_representable(self.available, new_held)?;
+        self.held = new_held;
         self.locked = true;
         Ok(self)
     }
@@ -301,5 +351,26 @@ mod tests {
             a.mark_charged_back(dec!(-1)).unwrap_err(),
             AccountError::InvalidAmount
         );
+    }
+
+    #[test]
+    fn credit_fails_when_available_would_overflow() {
+        let account = Account::new(1).credit(Decimal::MAX).unwrap();
+        let err = account.credit(Decimal::ONE).unwrap_err();
+        assert_eq!(err, AccountError::ArithmeticOverflow { client: 1 });
+    }
+
+    #[test]
+    fn credit_fails_when_combined_total_would_overflow() {
+        let account = Account::new(1)
+            .credit(Decimal::MAX)
+            .unwrap()
+            .hold(Decimal::MAX)
+            .unwrap();
+        assert_eq!(account.available(), Decimal::ZERO);
+        assert_eq!(account.held(), Decimal::MAX);
+
+        let err = account.credit(Decimal::ONE).unwrap_err();
+        assert_eq!(err, AccountError::ArithmeticOverflow { client: 1 });
     }
 }

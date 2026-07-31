@@ -1,4 +1,4 @@
-use crate::domain::errors::{AccountError, DepositError, DisputeError};
+use crate::domain::errors::DepositError;
 use crate::domain::{ClientId, TransactionId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,19 +41,10 @@ pub enum RejectionReason {
     },
 }
 
-impl From<AccountError> for RejectionReason {
-    fn from(e: AccountError) -> Self {
-        match e {
-            AccountError::InvalidAmount => Self::InvalidAmount,
-            AccountError::Locked { client } => Self::AccountLocked { client },
-            AccountError::InsufficientFunds { client } => Self::InsufficientFunds { client },
-            AccountError::InsufficientHeldFunds { client } => {
-                Self::InsufficientHeldFunds { client }
-            }
-        }
-    }
-}
-
+// No blanket `From<AccountError>` / `From<DisputeError>`:
+// `ArithmeticOverflow` must terminate processing rather than downgrade to
+// a rejection. Callers go through `helpers::classify_account_error` /
+// `helpers::classify_dispute_error`.
 impl From<DepositError> for RejectionReason {
     fn from(e: DepositError) -> Self {
         match e {
@@ -70,15 +61,6 @@ impl From<DepositError> for RejectionReason {
             DepositError::AlreadyDisputed { tx } => Self::DepositAlreadyDisputed { tx },
             DepositError::NotDisputed { tx } => Self::DepositNotDisputed { tx },
             DepositError::AlreadyChargedBack { tx } => Self::DepositAlreadyChargedBack { tx },
-        }
-    }
-}
-
-impl From<DisputeError> for RejectionReason {
-    fn from(e: DisputeError) -> Self {
-        match e {
-            DisputeError::Account(a) => a.into(),
-            DisputeError::Deposit(d) => d.into(),
         }
     }
 }

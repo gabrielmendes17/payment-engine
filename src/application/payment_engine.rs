@@ -94,6 +94,11 @@ mod tests {
         fn deposit(&self, tx: TransactionId) -> Option<Deposit> {
             self.deposits.borrow().get(&tx).cloned()
         }
+        fn seed_account(&self, account: Account) {
+            self.accounts
+                .borrow_mut()
+                .insert(account.client_id(), account);
+        }
     }
 
     struct FakeRepo {
@@ -563,5 +568,31 @@ mod tests {
         assert_eq!(state.commit_count(), commits_before);
         assert!(state.account(2).is_none());
         assert_eq!(state.deposit(1).unwrap().status(), DepositStatus::Disputed);
+    }
+
+    #[test]
+    fn deposit_overflow_returns_engine_error_and_does_not_commit() {
+        let (mut e, state) = engine();
+        let seeded = Account::new(1)
+            .credit(Decimal::MAX)
+            .unwrap()
+            .hold(Decimal::MAX)
+            .unwrap();
+        state.seed_account(seeded);
+        let commits_before = state.commit_count();
+
+        let err = e
+            .process(Transaction::Deposit {
+                client: 1,
+                tx: 99,
+                amount: dec!(1),
+            })
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ArithmeticOverflow { client: 1 }));
+        assert_eq!(state.commit_count(), commits_before);
+        let account = state.account(1).unwrap();
+        assert_eq!(account.available(), Decimal::ZERO);
+        assert_eq!(account.held(), Decimal::MAX);
+        assert!(!state.transaction_seen(99));
     }
 }

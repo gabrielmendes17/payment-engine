@@ -1,6 +1,6 @@
 use crate::application::changes::LedgerChanges;
 use crate::application::errors::EngineError;
-use crate::application::helpers::require_account;
+use crate::application::helpers::{classify_dispute_error, require_account};
 use crate::application::outcome::{ApplyOutcome, RejectionReason};
 use crate::application::ports::outbound::LedgerRepository;
 use crate::domain::services::dispute_service;
@@ -32,6 +32,9 @@ where
                 .map_err(EngineError::Repository)?;
             Ok(ApplyOutcome::Applied)
         }
-        Err(reason) => Ok(ApplyOutcome::Rejected(reason.into())),
+        Err(err) => {
+            let reason = classify_dispute_error(err)?;
+            Ok(ApplyOutcome::Rejected(reason))
+        }
     }
 }

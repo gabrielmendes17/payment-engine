@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::domain::ClientId;
+
 #[derive(Debug, Error)]
 pub enum EngineError<E>
 where
@@ -10,4 +12,7 @@ where
 
     #[error("invariant violation: {0}")]
     InvariantViolation(&'static str),
+
+    #[error("balance arithmetic overflow for client {client}")]
+    ArithmeticOverflow { client: ClientId },
 }
