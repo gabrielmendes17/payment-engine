@@ -8,6 +8,6 @@ mod application;
 pub mod domain;
 
 pub use application::{
-    ApplyOutcome, EngineError, LedgerChanges, LedgerRepository, ListAccounts, PaymentEngine,
-    ProcessTransaction, RejectionReason,
+    ApplyOutcome, CommittedChanges, EngineError, LedgerChanges, LedgerRepository, ListAccounts,
+    PaymentEngine, ProcessTransaction, RejectionReason,
 };

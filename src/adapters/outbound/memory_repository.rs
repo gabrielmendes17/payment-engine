@@ -40,12 +40,13 @@ impl LedgerRepository for InMemoryLedgerRepository {
     fn commit(&mut self, changes: LedgerChanges) -> Result<(), Self::Error> {
         // Pure upsert: the domain produced fully-updated entities and this
         // single-threaded adapter has no failure path between mutations.
-        let (account, reserve_tx, deposit) = changes.into_parts();
-        self.accounts.insert(account.client_id(), account);
-        if let Some(tx) = reserve_tx {
+        let committed = changes.into_parts();
+        self.accounts
+            .insert(committed.account.client_id(), committed.account);
+        if let Some(tx) = committed.reserve_transaction_id {
             self.seen_transaction_ids.insert(tx);
         }
-        if let Some(deposit) = deposit {
+        if let Some(deposit) = committed.deposit {
             self.deposits.insert(deposit.transaction_id(), deposit);
         }
         Ok(())

@@ -52,9 +52,10 @@ adapters/inbound   ──▶  application::ports::inbound::{ProcessTransaction, 
   `PaymentEngine` dispatcher. Kept private at the crate root; the
   caller-facing types (`PaymentEngine`, inbound ports, `EngineError`,
   `ApplyOutcome`, `RejectionReason`, `LedgerRepository`,
-  `LedgerChanges`) are publicly re-exported. External adapters
-  implement `LedgerRepository` and destructure committed change-sets
-  through `LedgerChanges::into_parts()`.
+  `LedgerChanges`, `CommittedChanges`) are publicly re-exported.
+  External adapters implement `LedgerRepository` and consume
+  committed change-sets via `LedgerChanges::into_parts() ->
+  CommittedChanges`.
 - **`adapters/inbound/`** — CSV parser and driver
   (`parse_rows`, `process_transactions`).
 - **`adapters/outbound/`** — in-memory `LedgerRepository` and CSV writer.
