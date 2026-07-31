@@ -5,14 +5,9 @@ use serde::Serialize;
 
 use crate::domain::Account;
 
-// Precision policy: normalize every amount to exactly four fractional digits
-// on the way out. The spec is lax about displayed precision, but consistent
-// 4-decimal output round-trips cleanly with 4-decimal input.
 const OUTPUT_SCALE: u32 = 4;
 
 fn format_amount(value: Decimal) -> String {
-    // round_dp trims trailing zeroes; format with {:.4} to zero-pad so every
-    // amount is exactly four fractional digits.
     format!("{:.*}", OUTPUT_SCALE as usize, value.round_dp(OUTPUT_SCALE))
 }
 
@@ -37,14 +32,10 @@ impl AccountRow {
     }
 }
 
-/// Write the final account snapshot as CSV. Row order is not significant
-/// per the spec, so we do not sort here — callers may sort before calling
-/// if a stable order helps their tests.
 pub fn write_accounts<W: Write>(writer: W, accounts: &[Account]) -> Result<(), ::csv::Error> {
+    // Header is written explicitly so it's still emitted when `accounts` is
+    // empty — `has_headers(true)` only emits on the first serialize call.
     let mut csv_writer = ::csv::WriterBuilder::new()
-        // Header is written explicitly below so we always emit it even when
-        // `accounts` is empty. csv::Writer with has_headers=true only writes
-        // the header on the first serialize() call.
         .has_headers(false)
         .from_writer(writer);
     csv_writer.write_record(["client", "available", "held", "total", "locked"])?;
@@ -58,7 +49,7 @@ pub fn write_accounts<W: Write>(writer: W, accounts: &[Account]) -> Result<(), :
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::DepositRecord;
+    use crate::domain::Deposit;
     use crate::domain::services::dispute_service;
     use rust_decimal_macros::dec;
 
@@ -75,16 +66,13 @@ mod tests {
         Account::new(client).credit(amount).unwrap()
     }
 
-    // Builds an account with `available = -amount` and `held = 0` and `locked = true`
-    // by running through deposit -> withdrawal -> dispute -> chargeback.
-    // Mirrors the end-to-end scenario in specs/05-acceptance-scenarios.md.
     fn chargeback_locked_negative(client: u16, deposited: Decimal, withdrawn: Decimal) -> Account {
         let account = Account::new(client)
             .credit(deposited)
             .unwrap()
             .debit(withdrawn)
             .unwrap();
-        let deposit = DepositRecord::new_applied(1, client, deposited);
+        let deposit = Deposit::new(1, client, deposited).unwrap();
         let (account, deposit) = dispute_service::apply_dispute(account, deposit).unwrap();
         let (account, _) = dispute_service::apply_chargeback(account, deposit).unwrap();
         account
@@ -106,9 +94,6 @@ mod tests {
 
     #[test]
     fn preserves_negative_available_and_locked_flag() {
-        // Deposit 100, withdraw 70 (available=30), dispute+chargeback the
-        // original 100 -> available=-70, held=0, locked=true, total=-70.
-        // Matches the shape of the end-to-end fixture.
         let account = chargeback_locked_negative(1, dec!(100), dec!(70));
         let mut buf = Vec::new();
         write_accounts(&mut buf, &[account]).unwrap();
@@ -118,10 +103,8 @@ mod tests {
 
     #[test]
     fn held_and_total_are_derived_consistently() {
-        // Fund 3, then dispute a 10-value synthetic deposit -> available=-7,
-        // held=10, total=3.
         let account = Account::new(5).credit(dec!(3)).unwrap();
-        let deposit = DepositRecord::new_applied(1, 5, dec!(10));
+        let deposit = Deposit::new(1, 5, dec!(10)).unwrap();
         let (account, _) = dispute_service::apply_dispute(account, deposit).unwrap();
         let mut buf = Vec::new();
         write_accounts(&mut buf, &[account]).unwrap();

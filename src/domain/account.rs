@@ -1,15 +1,13 @@
 use rust_decimal::Decimal;
 
-use crate::domain::outcome::RejectionReason;
+use crate::domain::errors::AccountError;
 
 pub type ClientId = u16;
 
-/// Aggregate root for a single client's balance and lock state.
-///
-/// Balance-changing methods take ownership of `self` and return an updated
-/// `Account` on success. This makes each transition explicit at call sites
-/// and mirrors the atomic-write model used by the outbound repository:
-/// either the whole new state is committed, or none of it is.
+/// Balance-changing methods consume `self` and return an updated `Account`.
+/// Low-level lifecycle transitions (`hold`, `release`, `mark_charged_back`)
+/// are `pub(crate)` so external callers must go through `dispute_service`,
+/// which enforces the ownership → lock → status ordering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
     client_id: ClientId,
@@ -48,9 +46,9 @@ impl Account {
         self.locked
     }
 
-    fn ensure_unlocked(&self) -> Result<(), RejectionReason> {
+    fn ensure_unlocked(&self) -> Result<(), AccountError> {
         if self.locked {
-            Err(RejectionReason::AccountLocked {
+            Err(AccountError::Locked {
                 client: self.client_id,
             })
         } else {
@@ -58,28 +56,26 @@ impl Account {
         }
     }
 
-    fn ensure_positive(amount: Decimal) -> Result<(), RejectionReason> {
+    fn ensure_positive(amount: Decimal) -> Result<(), AccountError> {
         if amount <= Decimal::ZERO {
-            Err(RejectionReason::InvalidAmount)
+            Err(AccountError::InvalidAmount)
         } else {
             Ok(())
         }
     }
 
-    /// Credit funds to available (deposit path).
-    pub fn credit(mut self, amount: Decimal) -> Result<Self, RejectionReason> {
+    pub fn credit(mut self, amount: Decimal) -> Result<Self, AccountError> {
         Self::ensure_positive(amount)?;
         self.ensure_unlocked()?;
         self.available += amount;
         Ok(self)
     }
 
-    /// Debit funds from available (withdrawal path).
-    pub fn debit(mut self, amount: Decimal) -> Result<Self, RejectionReason> {
+    pub fn debit(mut self, amount: Decimal) -> Result<Self, AccountError> {
         Self::ensure_positive(amount)?;
         self.ensure_unlocked()?;
         if self.available < amount {
-            return Err(RejectionReason::InsufficientFunds {
+            return Err(AccountError::InsufficientFunds {
                 client: self.client_id,
             });
         }
@@ -87,31 +83,40 @@ impl Account {
         Ok(self)
     }
 
-    /// Move value from available to held (dispute effect).
     /// May take `available` negative if the client has already spent the
-    /// disputed funds (see specs/05-acceptance-scenarios.md scenario 12).
-    pub fn hold(mut self, amount: Decimal) -> Result<Self, RejectionReason> {
+    /// disputed funds; `total = available + held` is preserved.
+    pub(crate) fn hold(mut self, amount: Decimal) -> Result<Self, AccountError> {
+        Self::ensure_positive(amount)?;
         self.ensure_unlocked()?;
         self.available -= amount;
         self.held += amount;
         Ok(self)
     }
 
-    /// Move value from held back to available (resolve effect).
-    pub fn release(mut self, amount: Decimal) -> Result<Self, RejectionReason> {
+    pub(crate) fn release(mut self, amount: Decimal) -> Result<Self, AccountError> {
+        Self::ensure_positive(amount)?;
         self.ensure_unlocked()?;
+        if self.held < amount {
+            return Err(AccountError::InsufficientHeldFunds {
+                client: self.client_id,
+            });
+        }
         self.available += amount;
         self.held -= amount;
         Ok(self)
     }
 
-    /// Terminal chargeback effect: remove held funds and lock the account.
-    /// This does not check the lock: the dispute-lifecycle status guard on
-    /// the owning deposit prevents double chargeback.
-    pub fn apply_chargeback(mut self, amount: Decimal) -> Self {
+    pub(crate) fn mark_charged_back(mut self, amount: Decimal) -> Result<Self, AccountError> {
+        Self::ensure_positive(amount)?;
+        self.ensure_unlocked()?;
+        if self.held < amount {
+            return Err(AccountError::InsufficientHeldFunds {
+                client: self.client_id,
+            });
+        }
         self.held -= amount;
         self.locked = true;
-        self
+        Ok(self)
     }
 }
 
@@ -157,12 +162,9 @@ mod tests {
         let a = Account::new(1);
         assert_eq!(
             a.clone().credit(Decimal::ZERO).unwrap_err(),
-            RejectionReason::InvalidAmount
+            AccountError::InvalidAmount
         );
-        assert_eq!(
-            a.credit(dec!(-1)).unwrap_err(),
-            RejectionReason::InvalidAmount
-        );
+        assert_eq!(a.credit(dec!(-1)).unwrap_err(), AccountError::InvalidAmount);
     }
 
     #[test]
@@ -170,7 +172,7 @@ mod tests {
         let a = account(1, Decimal::ZERO, Decimal::ZERO, true);
         assert_eq!(
             a.credit(dec!(1)).unwrap_err(),
-            RejectionReason::AccountLocked { client: 1 }
+            AccountError::Locked { client: 1 }
         );
     }
 
@@ -187,20 +189,20 @@ mod tests {
         let unlocked = account(1, dec!(1), Decimal::ZERO, false);
         assert_eq!(
             unlocked.clone().debit(Decimal::ZERO).unwrap_err(),
-            RejectionReason::InvalidAmount
+            AccountError::InvalidAmount
         );
         assert_eq!(
             unlocked.clone().debit(dec!(-1)).unwrap_err(),
-            RejectionReason::InvalidAmount
+            AccountError::InvalidAmount
         );
         assert_eq!(
             unlocked.debit(dec!(5)).unwrap_err(),
-            RejectionReason::InsufficientFunds { client: 1 }
+            AccountError::InsufficientFunds { client: 1 }
         );
         let locked = account(1, dec!(10), Decimal::ZERO, true);
         assert_eq!(
             locked.debit(dec!(1)).unwrap_err(),
-            RejectionReason::AccountLocked { client: 1 }
+            AccountError::Locked { client: 1 }
         );
     }
 
@@ -225,11 +227,20 @@ mod tests {
     }
 
     #[test]
-    fn hold_rejects_when_locked() {
-        let a = account(1, dec!(10), Decimal::ZERO, true);
+    fn hold_rejects_when_locked_or_invalid_amount() {
+        let locked = account(1, dec!(10), Decimal::ZERO, true);
         assert_eq!(
-            a.hold(dec!(1)).unwrap_err(),
-            RejectionReason::AccountLocked { client: 1 }
+            locked.hold(dec!(1)).unwrap_err(),
+            AccountError::Locked { client: 1 }
+        );
+        let unlocked = account(1, dec!(10), Decimal::ZERO, false);
+        assert_eq!(
+            unlocked.clone().hold(Decimal::ZERO).unwrap_err(),
+            AccountError::InvalidAmount
+        );
+        assert_eq!(
+            unlocked.hold(dec!(-1)).unwrap_err(),
+            AccountError::InvalidAmount
         );
     }
 
@@ -243,19 +254,52 @@ mod tests {
     }
 
     #[test]
-    fn release_rejects_when_locked() {
-        let a = account(1, dec!(6), dec!(4), true);
+    fn release_rejects_when_locked_invalid_or_over_held() {
+        let locked = account(1, dec!(6), dec!(4), true);
         assert_eq!(
-            a.release(dec!(4)).unwrap_err(),
-            RejectionReason::AccountLocked { client: 1 }
+            locked.release(dec!(4)).unwrap_err(),
+            AccountError::Locked { client: 1 }
+        );
+        let unlocked = account(1, dec!(6), dec!(4), false);
+        assert_eq!(
+            unlocked.clone().release(Decimal::ZERO).unwrap_err(),
+            AccountError::InvalidAmount
+        );
+        assert_eq!(
+            unlocked.release(dec!(5)).unwrap_err(),
+            AccountError::InsufficientHeldFunds { client: 1 }
         );
     }
 
     #[test]
-    fn apply_chargeback_removes_held_and_locks_regardless_of_prior_state() {
-        let unlocked = account(1, Decimal::ZERO, dec!(10), false).apply_chargeback(dec!(10));
+    fn mark_charged_back_removes_held_and_locks_regardless_of_prior_state() {
+        let unlocked = account(1, Decimal::ZERO, dec!(10), false)
+            .mark_charged_back(dec!(10))
+            .unwrap();
         assert_eq!(unlocked.available(), Decimal::ZERO);
         assert_eq!(unlocked.held(), Decimal::ZERO);
         assert!(unlocked.is_locked());
+    }
+
+    #[test]
+    fn mark_charged_back_rejects_on_locked_account() {
+        let locked = account(1, Decimal::ZERO, dec!(5), true);
+        assert_eq!(
+            locked.mark_charged_back(dec!(5)).unwrap_err(),
+            AccountError::Locked { client: 1 }
+        );
+    }
+
+    #[test]
+    fn mark_charged_back_rejects_over_held_or_invalid() {
+        let a = account(1, Decimal::ZERO, dec!(3), false);
+        assert_eq!(
+            a.clone().mark_charged_back(dec!(5)).unwrap_err(),
+            AccountError::InsufficientHeldFunds { client: 1 }
+        );
+        assert_eq!(
+            a.mark_charged_back(dec!(-1)).unwrap_err(),
+            AccountError::InvalidAmount
+        );
     }
 }

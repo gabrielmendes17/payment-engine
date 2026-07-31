@@ -1,7 +1,7 @@
 use rust_decimal::Decimal;
 
 use crate::domain::account::ClientId;
-use crate::domain::outcome::RejectionReason;
+use crate::domain::errors::DepositError;
 use crate::domain::transaction::TransactionId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,29 +11,31 @@ pub enum DepositStatus {
     ChargedBack,
 }
 
-/// Persisted record of a deposit that participates in the dispute
-/// lifecycle. Only deposits are retained after processing; withdrawals do
-/// not have lifecycle events (see specs/01-domain-model.md).
+/// Only deposits are retained after processing; withdrawals have no
+/// lifecycle events.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DepositRecord {
+pub struct Deposit {
     transaction_id: TransactionId,
     client_id: ClientId,
     amount: Decimal,
     status: DepositStatus,
 }
 
-impl DepositRecord {
-    pub fn new_applied(
+impl Deposit {
+    pub fn new(
         transaction_id: TransactionId,
         client_id: ClientId,
         amount: Decimal,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, DepositError> {
+        if amount <= Decimal::ZERO {
+            return Err(DepositError::InvalidAmount);
+        }
+        Ok(Self {
             transaction_id,
             client_id,
             amount,
             status: DepositStatus::Applied,
-        }
+        })
     }
 
     pub fn transaction_id(&self) -> TransactionId {
@@ -52,55 +54,61 @@ impl DepositRecord {
         self.status
     }
 
-    /// Ownership guard used by dispute/resolve/chargeback flows.
-    pub fn ensure_owned_by(&self, client: ClientId) -> Result<(), RejectionReason> {
+    pub fn ensure_owned_by(&self, client: ClientId) -> Result<(), DepositError> {
         if self.client_id == client {
             Ok(())
         } else {
-            Err(RejectionReason::ClientMismatch {
+            Err(DepositError::ClientMismatch {
                 tx: self.transaction_id,
-                expected_client: self.client_id,
-                actual_client: client,
+                owner_client: self.client_id,
+                requesting_client: client,
             })
         }
     }
 
-    /// Transition Applied -> Disputed.
-    pub fn begin_dispute(mut self) -> Result<Self, RejectionReason> {
+    pub(crate) fn begin_dispute(mut self) -> Result<Self, DepositError> {
         match self.status {
             DepositStatus::Applied => {
                 self.status = DepositStatus::Disputed;
                 Ok(self)
             }
-            DepositStatus::Disputed => Err(RejectionReason::DepositAlreadyDisputed {
+            DepositStatus::Disputed => Err(DepositError::AlreadyDisputed {
                 tx: self.transaction_id,
             }),
-            DepositStatus::ChargedBack => Err(RejectionReason::DepositAlreadyChargedBack {
+            DepositStatus::ChargedBack => Err(DepositError::AlreadyChargedBack {
                 tx: self.transaction_id,
             }),
         }
     }
 
-    /// Transition Disputed -> Applied.
-    pub fn resolve(mut self) -> Result<Self, RejectionReason> {
-        if self.status != DepositStatus::Disputed {
-            return Err(RejectionReason::DepositNotDisputed {
+    pub(crate) fn resolve(mut self) -> Result<Self, DepositError> {
+        match self.status {
+            DepositStatus::Disputed => {
+                self.status = DepositStatus::Applied;
+                Ok(self)
+            }
+            DepositStatus::Applied => Err(DepositError::NotDisputed {
                 tx: self.transaction_id,
-            });
+            }),
+            DepositStatus::ChargedBack => Err(DepositError::AlreadyChargedBack {
+                tx: self.transaction_id,
+            }),
         }
-        self.status = DepositStatus::Applied;
-        Ok(self)
     }
 
-    /// Terminal transition Disputed -> ChargedBack.
-    pub fn charge_back(mut self) -> Result<Self, RejectionReason> {
-        if self.status != DepositStatus::Disputed {
-            return Err(RejectionReason::DepositNotDisputed {
+    pub(crate) fn mark_charged_back(mut self) -> Result<Self, DepositError> {
+        match self.status {
+            DepositStatus::Disputed => {
+                self.status = DepositStatus::ChargedBack;
+                Ok(self)
+            }
+            DepositStatus::Applied => Err(DepositError::NotDisputed {
                 tx: self.transaction_id,
-            });
+            }),
+            DepositStatus::ChargedBack => Err(DepositError::AlreadyChargedBack {
+                tx: self.transaction_id,
+            }),
         }
-        self.status = DepositStatus::ChargedBack;
-        Ok(self)
     }
 }
 
@@ -109,17 +117,30 @@ mod tests {
     use super::*;
     use rust_decimal_macros::dec;
 
-    fn applied(tx: TransactionId, client: ClientId) -> DepositRecord {
-        DepositRecord::new_applied(tx, client, dec!(10.0000))
+    fn applied(tx: TransactionId, client: ClientId) -> Deposit {
+        Deposit::new(tx, client, dec!(10.0000)).unwrap()
     }
 
     #[test]
-    fn new_applied_starts_in_applied_status() {
+    fn new_starts_in_applied_status() {
         let d = applied(7, 1);
         assert_eq!(d.transaction_id(), 7);
         assert_eq!(d.client_id(), 1);
         assert_eq!(d.amount(), dec!(10.0000));
         assert_eq!(d.status(), DepositStatus::Applied);
+    }
+
+    #[test]
+    fn new_rejects_zero_and_negative_amount() {
+        use rust_decimal::Decimal;
+        assert_eq!(
+            Deposit::new(1, 1, Decimal::ZERO).unwrap_err(),
+            DepositError::InvalidAmount
+        );
+        assert_eq!(
+            Deposit::new(1, 1, dec!(-1)).unwrap_err(),
+            DepositError::InvalidAmount
+        );
     }
 
     #[test]
@@ -132,10 +153,10 @@ mod tests {
         let err = applied(1, 1).ensure_owned_by(2).unwrap_err();
         assert_eq!(
             err,
-            RejectionReason::ClientMismatch {
+            DepositError::ClientMismatch {
                 tx: 1,
-                expected_client: 1,
-                actual_client: 2,
+                owner_client: 1,
+                requesting_client: 2,
             }
         );
     }
@@ -151,12 +172,12 @@ mod tests {
         let disputed = applied(1, 1).begin_dispute().unwrap();
         assert_eq!(
             disputed.clone().begin_dispute().unwrap_err(),
-            RejectionReason::DepositAlreadyDisputed { tx: 1 }
+            DepositError::AlreadyDisputed { tx: 1 }
         );
-        let charged_back = disputed.charge_back().unwrap();
+        let charged_back = disputed.mark_charged_back().unwrap();
         assert_eq!(
             charged_back.begin_dispute().unwrap_err(),
-            RejectionReason::DepositAlreadyChargedBack { tx: 1 }
+            DepositError::AlreadyChargedBack { tx: 1 }
         );
     }
 
@@ -166,24 +187,48 @@ mod tests {
         let resolved = disputed.resolve().unwrap();
         assert_eq!(resolved.status(), DepositStatus::Applied);
 
-        // Applied -> resolve is rejected
         assert_eq!(
-            resolved.resolve().unwrap_err(),
-            RejectionReason::DepositNotDisputed { tx: 1 }
+            resolved.clone().resolve().unwrap_err(),
+            DepositError::NotDisputed { tx: 1 }
+        );
+
+        let charged_back = resolved
+            .begin_dispute()
+            .unwrap()
+            .mark_charged_back()
+            .unwrap();
+        assert_eq!(
+            charged_back.resolve().unwrap_err(),
+            DepositError::AlreadyChargedBack { tx: 1 }
         );
     }
 
     #[test]
-    fn charge_back_succeeds_from_disputed_only() {
+    fn mark_charged_back_succeeds_from_disputed_only() {
         let disputed = applied(1, 1).begin_dispute().unwrap();
-        let charged_back = disputed.charge_back().unwrap();
+        let charged_back = disputed.mark_charged_back().unwrap();
         assert_eq!(charged_back.status(), DepositStatus::ChargedBack);
 
-        // Disputed already consumed; a second charge_back on a non-disputed
-        // record must fail.
         assert_eq!(
-            charged_back.charge_back().unwrap_err(),
-            RejectionReason::DepositNotDisputed { tx: 1 }
+            charged_back.mark_charged_back().unwrap_err(),
+            DepositError::AlreadyChargedBack { tx: 1 }
         );
+
+        assert_eq!(
+            applied(2, 1).mark_charged_back().unwrap_err(),
+            DepositError::NotDisputed { tx: 2 }
+        );
+    }
+
+    #[test]
+    fn begin_dispute_succeeds_again_after_resolve() {
+        let redisputed = applied(1, 1)
+            .begin_dispute()
+            .unwrap()
+            .resolve()
+            .unwrap()
+            .begin_dispute()
+            .unwrap();
+        assert_eq!(redisputed.status(), DepositStatus::Disputed);
     }
 }

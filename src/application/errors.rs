@@ -1,11 +1,9 @@
-use std::fmt::{Debug, Display};
-
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum EngineError<E>
 where
-    E: Debug + Display,
+    E: std::error::Error + Send + Sync + 'static,
 {
     #[error("repository error: {0}")]
     Repository(#[source] E),

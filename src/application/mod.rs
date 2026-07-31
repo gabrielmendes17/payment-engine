@@ -1,12 +1,12 @@
-pub mod changes;
-pub mod errors;
-pub mod helpers;
-pub mod payment_engine;
-pub mod ports;
-pub mod use_cases;
+pub(crate) mod changes;
+pub(crate) mod errors;
+pub(crate) mod helpers;
+pub(crate) mod outcome;
+pub(crate) mod payment_engine;
+pub(crate) mod ports;
+pub(crate) mod use_cases;
 
-pub use changes::{AccountChange, DepositChange, LedgerChanges};
 pub use errors::EngineError;
+pub use outcome::{ApplyOutcome, RejectionReason};
 pub use payment_engine::PaymentEngine;
-pub use ports::inbound::ProcessTransaction;
-pub use ports::outbound::PaymentRepository;
+pub use ports::inbound::{ListAccounts, ProcessTransaction};

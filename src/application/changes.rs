@@ -1,43 +1,30 @@
-use crate::domain::{Account, DepositRecord, DepositStatus, TransactionId};
+use crate::domain::{Account, Deposit, TransactionId};
 
+/// Fields are `pub(crate)` so external code cannot build or inspect a
+/// change-set — this effectively seals `LedgerRepository`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AccountChange {
-    Upsert(Account),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DepositChange {
-    Insert(DepositRecord),
-    UpdateStatus {
-        tx: TransactionId,
-        new_status: DepositStatus,
-    },
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LedgerChanges {
-    pub account: Option<AccountChange>,
-    pub reserve_transaction_id: Option<TransactionId>,
-    pub deposit: Option<DepositChange>,
+    pub(crate) account: Account,
+    pub(crate) reserve_transaction_id: Option<TransactionId>,
+    pub(crate) deposit: Option<Deposit>,
 }
 
 impl LedgerChanges {
-    pub fn new() -> Self {
-        Self::default()
+    pub(crate) fn new(account: Account) -> Self {
+        Self {
+            account,
+            reserve_transaction_id: None,
+            deposit: None,
+        }
     }
 
-    pub fn with_account(mut self, account: Account) -> Self {
-        self.account = Some(AccountChange::Upsert(account));
-        self
-    }
-
-    pub fn reserving(mut self, tx: TransactionId) -> Self {
+    pub(crate) fn reserving(mut self, tx: TransactionId) -> Self {
         self.reserve_transaction_id = Some(tx);
         self
     }
 
-    pub fn with_deposit(mut self, change: DepositChange) -> Self {
-        self.deposit = Some(change);
+    pub(crate) fn with_deposit(mut self, deposit: Deposit) -> Self {
+        self.deposit = Some(deposit);
         self
     }
 }

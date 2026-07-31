@@ -1,50 +1,56 @@
-use std::fmt::{Debug, Display};
-
 use rust_decimal::Decimal;
 
-use crate::application::changes::{DepositChange, LedgerChanges};
+use crate::application::changes::LedgerChanges;
 use crate::application::errors::EngineError;
-use crate::application::helpers::{load_or_new_account, repo_err};
-use crate::application::ports::outbound::PaymentRepository;
-use crate::domain::{ApplyOutcome, ClientId, DepositRecord, RejectionReason, TransactionId};
+use crate::application::helpers::load_or_new_account;
+use crate::application::outcome::{ApplyOutcome, RejectionReason};
+use crate::application::ports::outbound::LedgerRepository;
+use crate::domain::{ClientId, Deposit, TransactionId};
 
-/// Deposit use case.
-///
-/// - Reject duplicate `tx` before touching state.
-/// - For any domain rejection on the primary path, still reserve `tx` so it
-///   cannot be reused later. This matches specs/02-processing-rules.md.
-pub fn run<R>(
+/// A rejected primary tx still reserves its id — a tx number is a one-shot
+/// identifier regardless of outcome.
+pub(crate) fn execute<R>(
     repository: &mut R,
     client: ClientId,
     tx: TransactionId,
     amount: Decimal,
 ) -> Result<ApplyOutcome, EngineError<R::Error>>
 where
-    R: PaymentRepository,
-    R::Error: Debug + Display,
+    R: LedgerRepository,
 {
-    if repository.transaction_seen(tx).map_err(repo_err)? {
+    if repository
+        .transaction_seen(tx)
+        .map_err(EngineError::Repository)?
+    {
         return Ok(ApplyOutcome::Rejected(
             RejectionReason::DuplicateTransaction { tx },
         ));
     }
 
     let account = load_or_new_account(repository, client)?;
-    match account.credit(amount) {
+    // Clone so the rejection branch can persist the unmutated account —
+    // a later lifecycle event on a first-time client would otherwise fail
+    // with "deposit exists without owning account".
+    match account.clone().credit(amount) {
         Ok(updated) => {
-            let deposit = DepositRecord::new_applied(tx, client, amount);
-            let changes = LedgerChanges::new()
+            let deposit = Deposit::new(tx, client, amount).map_err(|_| {
+                EngineError::InvariantViolation(
+                    "credit succeeded but deposit construction rejected the amount",
+                )
+            })?;
+            let changes = LedgerChanges::new(updated)
                 .reserving(tx)
-                .with_account(updated)
-                .with_deposit(DepositChange::Insert(deposit));
-            repository.commit(changes).map_err(repo_err)?;
+                .with_deposit(deposit);
+            repository
+                .commit(changes)
+                .map_err(EngineError::Repository)?;
             Ok(ApplyOutcome::Applied)
         }
         Err(reason) => {
             repository
-                .commit(LedgerChanges::new().reserving(tx))
-                .map_err(repo_err)?;
-            Ok(ApplyOutcome::Rejected(reason))
+                .commit(LedgerChanges::new(account).reserving(tx))
+                .map_err(EngineError::Repository)?;
+            Ok(ApplyOutcome::Rejected(reason.into()))
         }
     }
 }

@@ -1,3 +1,3 @@
 pub mod csv;
 
-pub use csv::{AdapterError, drive, parse_rows};
+pub use csv::{CsvInputError, DriveError, parse_rows, process_transactions};

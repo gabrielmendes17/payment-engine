@@ -8,7 +8,7 @@ use crate::application::ports::inbound::ProcessTransaction;
 use crate::domain::{ClientId, Transaction, TransactionId};
 
 #[derive(Debug, Error)]
-pub enum AdapterError {
+pub enum CsvInputError {
     #[error("csv parse error at row {row}: {source}")]
     Csv {
         row: u64,
@@ -25,32 +25,37 @@ pub enum AdapterError {
         kind: &'static str,
         tx: TransactionId,
     },
-
-    #[error("processor error: {0}")]
-    Processor(String),
 }
 
-// Wire format. `type` is a reserved keyword, so we rename via serde.
+#[derive(Debug, Error)]
+pub enum DriveError<E>
+where
+    E: std::error::Error + 'static,
+{
+    #[error(transparent)]
+    Input(#[from] CsvInputError),
+
+    #[error("transaction processor failed")]
+    Processor(#[source] E),
+}
+
 #[derive(Debug, Deserialize)]
 struct CsvRow {
     #[serde(rename = "type")]
     kind: String,
     client: ClientId,
     tx: TransactionId,
-    // Optional so dispute/resolve/chargeback rows (which have no amount)
-    // parse correctly. We validate presence at conversion time.
     amount: Option<Decimal>,
 }
 
 impl CsvRow {
-    fn into_transaction(self, row: u64) -> Result<Transaction, AdapterError> {
-        // Trim so surrounding whitespace on the type column is tolerated.
+    fn into_transaction(self, row: u64) -> Result<Transaction, CsvInputError> {
         let kind = self.kind.trim();
         match kind {
             "deposit" => Ok(Transaction::Deposit {
                 client: self.client,
                 tx: self.tx,
-                amount: self.amount.ok_or(AdapterError::MissingAmount {
+                amount: self.amount.ok_or(CsvInputError::MissingAmount {
                     row,
                     kind: "deposit",
                     tx: self.tx,
@@ -59,7 +64,7 @@ impl CsvRow {
             "withdrawal" => Ok(Transaction::Withdrawal {
                 client: self.client,
                 tx: self.tx,
-                amount: self.amount.ok_or(AdapterError::MissingAmount {
+                amount: self.amount.ok_or(CsvInputError::MissingAmount {
                     row,
                     kind: "withdrawal",
                     tx: self.tx,
@@ -77,7 +82,7 @@ impl CsvRow {
                 client: self.client,
                 tx: self.tx,
             }),
-            other => Err(AdapterError::UnknownType {
+            other => Err(CsvInputError::UnknownType {
                 row,
                 value: other.to_string(),
             }),
@@ -85,14 +90,11 @@ impl CsvRow {
     }
 }
 
-/// Stream CSV rows from any `Read` source, one at a time. Each element is
-/// either a parsed `Transaction` or an `AdapterError` describing where and
-/// why parsing failed.
-pub fn parse_rows<R: Read>(reader: R) -> impl Iterator<Item = Result<Transaction, AdapterError>> {
+pub fn parse_rows<R: Read>(reader: R) -> impl Iterator<Item = Result<Transaction, CsvInputError>> {
     let csv_reader = ::csv::ReaderBuilder::new()
         .has_headers(true)
-        .trim(::csv::Trim::All) // tolerate whitespace around every field
-        .flexible(true) // dispute/resolve/chargeback may omit the amount field entirely
+        .trim(::csv::Trim::All)
+        .flexible(true)
         .from_reader(reader);
     RowIter {
         inner: csv_reader.into_deserialize::<CsvRow>(),
@@ -106,7 +108,7 @@ struct RowIter<R: Read> {
 }
 
 impl<R: Read> Iterator for RowIter<R> {
-    type Item = Result<Transaction, AdapterError>;
+    type Item = Result<Transaction, CsvInputError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let raw = self.inner.next()?;
@@ -114,7 +116,7 @@ impl<R: Read> Iterator for RowIter<R> {
         let row_number = self.row;
         Some(match raw {
             Ok(csv_row) => csv_row.into_transaction(row_number),
-            Err(source) => Err(AdapterError::Csv {
+            Err(source) => Err(CsvInputError::Csv {
                 row: row_number,
                 source,
             }),
@@ -122,24 +124,17 @@ impl<R: Read> Iterator for RowIter<R> {
     }
 }
 
-/// Drive a stream of parsed transactions through an inbound port.
-///
-/// - Domain rejections from the port do not stop the stream.
-/// - CSV parse errors and processor errors do stop the stream.
-/// - This function is generic over the iterator so it can be fed by
-///   `parse_rows`, an in-memory `Vec`, or (in the future) a channel-backed
-///   source. See `docs/adr/0003-concurrency-model.md`.
-pub fn drive<I, P>(source: I, port: &mut P) -> Result<(), AdapterError>
+/// Drive parsed transactions through an inbound port. Parse and processor
+/// errors stop the stream; domain rejections do not.
+pub fn process_transactions<I, P>(source: I, port: &mut P) -> Result<(), DriveError<P::Error>>
 where
-    I: IntoIterator<Item = Result<Transaction, AdapterError>>,
+    I: IntoIterator<Item = Result<Transaction, CsvInputError>>,
     P: ProcessTransaction,
-    P::Error: std::fmt::Display,
+    P::Error: std::error::Error + 'static,
 {
     for item in source {
         let transaction = item?;
-        // Ignore ApplyOutcome::Rejected — it is a normal domain event.
-        port.process(transaction)
-            .map_err(|e| AdapterError::Processor(e.to_string()))?;
+        port.process(transaction).map_err(DriveError::Processor)?;
     }
     Ok(())
 }
@@ -147,10 +142,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{ApplyOutcome, Transaction};
+    use crate::application::outcome::{ApplyOutcome, RejectionReason};
+    use crate::domain::Transaction;
     use rust_decimal_macros::dec;
 
-    // Scenario 18: a valid CSV row converts into the correct domain transaction
     #[test]
     fn valid_rows_convert_to_domain_transactions() {
         let csv = "\
@@ -216,7 +211,6 @@ deposit,1,1,1.2345
         }
     }
 
-    // Scenario 19: missing deposit or withdrawal amount fails before the application
     #[test]
     fn missing_deposit_or_withdrawal_amount_is_a_parse_error() {
         let csv = "\
@@ -226,7 +220,7 @@ deposit,1,1,
         let err = parse_rows(csv.as_bytes()).next().unwrap().unwrap_err();
         assert!(matches!(
             err,
-            AdapterError::MissingAmount {
+            CsvInputError::MissingAmount {
                 kind: "deposit",
                 ..
             }
@@ -239,14 +233,13 @@ withdrawal,1,1,
         let err = parse_rows(csv.as_bytes()).next().unwrap().unwrap_err();
         assert!(matches!(
             err,
-            AdapterError::MissingAmount {
+            CsvInputError::MissingAmount {
                 kind: "withdrawal",
                 ..
             }
         ));
     }
 
-    // Scenario 21: a malformed CSV row stops processing with an adapter error
     #[test]
     fn unknown_type_yields_adapter_error() {
         let csv = "\
@@ -254,7 +247,7 @@ type,client,tx,amount
 teleport,1,1,1.0
 ";
         let err = parse_rows(csv.as_bytes()).next().unwrap().unwrap_err();
-        assert!(matches!(err, AdapterError::UnknownType { .. }));
+        assert!(matches!(err, CsvInputError::UnknownType { .. }));
     }
 
     #[test]
@@ -264,7 +257,7 @@ type,client,tx,amount
 deposit,1,1,not-a-number
 ";
         let err = parse_rows(csv.as_bytes()).next().unwrap().unwrap_err();
-        assert!(matches!(err, AdapterError::Csv { .. }));
+        assert!(matches!(err, CsvInputError::Csv { .. }));
     }
 
     #[test]
@@ -274,10 +267,9 @@ type,client,tx,amount
 deposit,999999,1,1.0
 ";
         let err = parse_rows(csv.as_bytes()).next().unwrap().unwrap_err();
-        assert!(matches!(err, AdapterError::Csv { .. }));
+        assert!(matches!(err, CsvInputError::Csv { .. }));
     }
 
-    // In-memory fake port for the driver tests
     struct RecordingPort {
         seen: Vec<Transaction>,
         fail_at: Option<usize>,
@@ -298,13 +290,9 @@ deposit,999999,1,1.0
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, thiserror::Error)]
+    #[error("{0}")]
     struct PortErr(&'static str);
-    impl std::fmt::Display for PortErr {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str(self.0)
-        }
-    }
 
     impl ProcessTransaction for RecordingPort {
         type Error = PortErr;
@@ -315,24 +303,22 @@ deposit,999999,1,1.0
                     return Err(PortErr("boom"));
                 }
             }
-            // Always applied — domain-level rejection is out of scope for the driver.
             Ok(ApplyOutcome::Applied)
         }
     }
 
-    // Scenario 20: a domain rejection does not stop the CSV stream
     #[test]
-    fn drive_ignores_domain_rejections_and_processes_all_rows() {
+    fn process_transactions_ignores_domain_rejections_and_processes_all_rows() {
+        #[derive(Debug, thiserror::Error)]
+        enum Never {}
         struct RejectingPort {
             count: usize,
         }
         impl ProcessTransaction for RejectingPort {
-            type Error = std::convert::Infallible;
+            type Error = Never;
             fn process(&mut self, _t: Transaction) -> Result<ApplyOutcome, Self::Error> {
                 self.count += 1;
-                Ok(ApplyOutcome::Rejected(
-                    crate::domain::RejectionReason::InvalidAmount,
-                ))
+                Ok(ApplyOutcome::Rejected(RejectionReason::InvalidAmount))
             }
         }
         let csv = "\
@@ -342,12 +328,12 @@ deposit,1,2,2.0
 deposit,1,3,3.0
 ";
         let mut port = RejectingPort { count: 0 };
-        drive(parse_rows(csv.as_bytes()), &mut port).unwrap();
+        process_transactions(parse_rows(csv.as_bytes()), &mut port).unwrap();
         assert_eq!(port.count, 3);
     }
 
     #[test]
-    fn drive_stops_on_processor_error() {
+    fn process_transactions_stops_on_processor_error_and_preserves_type() {
         let csv = "\
 type,client,tx,amount
 deposit,1,1,1.0
@@ -355,13 +341,16 @@ deposit,1,2,2.0
 deposit,1,3,3.0
 ";
         let mut port = RecordingPort::failing_after(1);
-        let err = drive(parse_rows(csv.as_bytes()), &mut port).unwrap_err();
-        assert!(matches!(err, AdapterError::Processor(_)));
-        assert_eq!(port.seen.len(), 2); // stopped after the second row raised
+        let err = process_transactions(parse_rows(csv.as_bytes()), &mut port).unwrap_err();
+        match err {
+            DriveError::Processor(PortErr(msg)) => assert_eq!(msg, "boom"),
+            other => panic!("expected Processor error, got {other:?}"),
+        }
+        assert_eq!(port.seen.len(), 2);
     }
 
     #[test]
-    fn drive_stops_on_parse_error_without_calling_port_for_that_row() {
+    fn process_transactions_stops_on_parse_error_without_calling_port_for_that_row() {
         let csv = "\
 type,client,tx,amount
 deposit,1,1,1.0
@@ -369,8 +358,11 @@ teleport,1,2,1.0
 deposit,1,3,3.0
 ";
         let mut port = RecordingPort::new();
-        let err = drive(parse_rows(csv.as_bytes()), &mut port).unwrap_err();
-        assert!(matches!(err, AdapterError::UnknownType { .. }));
+        let err = process_transactions(parse_rows(csv.as_bytes()), &mut port).unwrap_err();
+        assert!(matches!(
+            err,
+            DriveError::Input(CsvInputError::UnknownType { .. })
+        ));
         assert_eq!(port.seen.len(), 1);
     }
 }

@@ -6,15 +6,14 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, anyhow};
 
-use payment_engine::adapters::inbound::{drive, parse_rows};
-use payment_engine::adapters::outbound::{InMemoryPaymentRepository, write_accounts};
-use payment_engine::application::{PaymentEngine, PaymentRepository};
+use payment_engine::adapters::inbound::{parse_rows, process_transactions};
+use payment_engine::adapters::outbound::{InMemoryLedgerRepository, write_accounts};
+use payment_engine::{ListAccounts, PaymentEngine};
 
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            // Diagnostics go to stderr per specs/04-io-contract.md.
             let _ = writeln!(io::stderr(), "error: {err:#}");
             ExitCode::FAILURE
         }
@@ -28,15 +27,12 @@ fn run() -> Result<()> {
         .with_context(|| format!("opening input file {}", input_path.display()))?;
     let reader = BufReader::new(file);
 
-    let repository = InMemoryPaymentRepository::new();
+    let repository = InMemoryLedgerRepository::new();
     let mut engine = PaymentEngine::new(repository);
 
-    drive(parse_rows(reader), &mut engine).context("processing transactions")?;
+    process_transactions(parse_rows(reader), &mut engine).context("processing transactions")?;
 
-    let accounts = engine
-        .repository()
-        .accounts()
-        .expect("in-memory repository is infallible");
+    let accounts = engine.list_accounts().context("listing accounts")?;
 
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
