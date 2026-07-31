@@ -25,3 +25,6 @@ __MACOSX/
 # Local run artifacts
 /accounts.csv
 /transactions.csv
+
+# Throwaway helper scripts (transcript builder, etc.)
+/scripts/
