@@ -11,6 +11,9 @@ Requires Rust 1.85+ (edition 2024).
 ```bash
 cargo build --release
 cargo run --release -- tests/fixtures/spec_sample.csv > accounts.csv
+
+# Debug build for local experiments
+cargo run -- sample.csv
 ```
 
 Input path is a required positional argument. Output goes to stdout;
@@ -20,8 +23,9 @@ Exit codes:
 
 - `0` — success. Rejected transactions still count as success; they are
   normal business outcomes and do not stop the stream.
-- `1` — I/O, parse, or repository failure. The error is printed to stderr
-  with an `error:` prefix and its full cause chain.
+- `1` — I/O, parse, repository, or invariant failure (including balance
+  arithmetic overflow). The error is printed to stderr with an `error:`
+  prefix and its full cause chain.
 
 ## Architecture
 
@@ -61,6 +65,98 @@ adapters/inbound   ──▶  application::ports::inbound::{ProcessTransaction, 
 - **`adapters/outbound/`** — in-memory `LedgerRepository` and CSV writer.
 - **`src/main.rs`** — composition root: opens the file, wires the engine,
   streams input, writes output.
+
+## Future concurrent TCP ingestion
+
+The submitted application intentionally keeps transaction processing
+single-threaded. The CSV is already an ordered stream, and deposits,
+withdrawals, disputes, resolves, and chargebacks are order-dependent. Running
+rows concurrently would therefore require an explicit ordering policy and a
+clear owner for mutable ledger state, while providing no clear benefit for the
+current CLI.
+
+If the application evolved into a service receiving transactions from multiple
+TCP connections, network concurrency would be separated from ledger mutation.
+Each connection could be handled by an asynchronous task responsible for
+framing, deserialization, validation, and writing the response. Validated
+commands would be sent through a **bounded MPSC channel** to one task that
+exclusively owns the `PaymentEngine`:
+
+```text
+TCP connection tasks
+        │
+        ▼
+bounded MPSC command channel
+        │
+        ▼
+single PaymentEngine owner
+        │
+        ▼
+LedgerRepository
+```
+
+This is an actor-style ownership model implemented with ordinary async tasks
+and channels rather than an actor framework. The engine task owns all mutable
+account, deposit, and transaction-ID state, and other tasks interact with it
+only by sending commands. The existing domain and application code can remain
+synchronous because the asynchronous behavior stays in the inbound adapter.
+A one-shot response channel could return each `ApplyOutcome` or engine error to
+the connection task.
+
+A bounded channel is intentional. If producers submit transactions faster than
+the engine can process them, the queue eventually fills and applies
+backpressure to the connection tasks. An unbounded queue could continue growing
+until memory is exhausted.
+
+A shared `Arc<Mutex<Ledger>>` could prevent data races, but it would not by
+itself define the business order of requests arriving through different
+connections. Locking individual repository methods would also be insufficient:
+the current use cases perform a read–compute–commit sequence, such as checking
+`transaction_seen`, loading an account, computing a new state, and committing
+the changes. The complete sequence must be atomic. A single engine-owning task
+serializes the entire `PaymentEngine::process` operation and avoids holding
+locks across asynchronous work.
+
+If profiling later showed that one engine task was a throughput bottleneck, the
+next step would be a fixed number of client shards:
+
+```text
+TCP connection tasks
+        │
+        ▼
+router by client ID
+        │
+        ├── bounded queue ──▶ shard 0 PaymentEngine
+        ├── bounded queue ──▶ shard 1 PaymentEngine
+        └── bounded queue ──▶ shard N PaymentEngine
+```
+
+Every command for one client must always be routed to the same shard. This
+preserves sequential processing for one account while allowing unrelated
+clients to be processed in parallel. Shards should represent stable logical
+partitions, not TCP connections, because clients may disconnect, reconnect, or
+submit commands through different connections.
+
+Sharding introduces coordination requirements that do not exist in the current
+single-owner implementation. The current engine enforces globally unique
+primary transaction IDs and can distinguish an unknown deposit from one owned
+by another client. Independent shard repositories would need a global
+transaction-ID reservation and ownership index, or persistent storage with
+corresponding uniqueness and lookup guarantees, to preserve those semantics.
+
+The service would also need an explicit ordering and idempotency contract. A
+basic version could define the authoritative order for one client as the order
+in which the router admits commands to that client's shard queue. A stronger
+protocol could include a unique request ID and a monotonically increasing
+per-client sequence number so retries, duplicates, gaps, and out-of-order
+requests can be handled deterministically.
+
+Channels and actors solve in-process concurrency, not durability. A production
+service would additionally require persistent idempotency records, atomic
+storage updates, restart recovery, shard ownership, graceful shutdown,
+observability, and overload handling. These concerns are intentionally outside
+the scope of this CLI, while the `ProcessTransaction` inbound port keeps the
+core engine independent from CSV, TCP, Tokio, or any other transport.
 
 ## Business assumptions
 
@@ -107,19 +203,29 @@ decision is stated so a reviewer can audit it directly.
 - **Domain errors** (`AccountError`, `DepositError`, `DisputeError`) are
   narrow — each names only the invariants its owning entity is responsible
   for. They implement `std::error::Error` via `thiserror`.
-- **Business rejection outcomes** (`RejectionReason`) are cross-cutting:
-  they carry the union of domain errors plus repository-wide concerns
-  (`DuplicateTransaction`, `DepositNotFound`). They live inside
-  `Ok(ApplyOutcome::Rejected(_))`, not `Err`, because a rejected
-  transaction is a normal business event. The application layer maps
-  domain errors into `RejectionReason` at the use-case boundary.
+- **Business rejections** (`RejectionReason`) live inside
+  `Ok(ApplyOutcome::Rejected(_))`. Each use case classifies its domain
+  error explicitly via `helpers::classify_account_error` /
+  `helpers::classify_dispute_error`: business variants map to a
+  `RejectionReason`; `AccountError::ArithmeticOverflow` is lifted to
+  `EngineError::ArithmeticOverflow { client }` and terminates processing
+  rather than downgrading to a rejection. There is intentionally no
+  blanket `From<AccountError>` / `From<DisputeError>` because that
+  conversion cannot represent the fatal variant safely.
+- **Checked balance arithmetic**: every `Account` balance operation uses
+  `checked_add` / `checked_sub`, computes all new field values before any
+  assignment, and validates the resulting `available + held` so `total()`
+  cannot panic on already-persisted state. Overflow returns a typed error
+  rather than panicking.
 - **Engine errors** (`EngineError<E>`) wrap repository failures with their
   concrete `E` so callers can downcast or match. `E` is required to be
-  `std::error::Error + Send + Sync + 'static`.
+  `std::error::Error + Send + Sync + 'static`. `ArithmeticOverflow` is a
+  peer variant that carries the affected `client`.
 - **CSV/driver errors** (`CsvInputError`, `DriveError<E>`) preserve the
   original processor error type — no stringification.
-- **Rejected transactions** are normal business outcomes: they never
-  stop the stream. Only parse errors and repository failures do.
+- **Rejected transactions** are normal business outcomes: they never stop
+  the stream. Parse errors, repository failures, and arithmetic-overflow
+  invariants do.
 
 ## Complexity
 
@@ -152,6 +258,9 @@ Unit tests are colocated with each module; integration tests live in
 - account behavior after locking — every subsequent operation is
   rejected, including chargebacks of a different disputed deposit;
 - exact four-decimal arithmetic through the pipeline;
+- decimal balance-arithmetic overflow (direct `checked_add` overflow,
+  the combined `available + held` guard, and no repository commit on
+  failure);
 - the invariant `total = available + held` across mixed sequences;
 - CSV parsing (whitespace, empty amounts, malformed rows, unknown
   types) and complete CLI behavior (exit codes, stdout/stderr,
@@ -182,13 +291,13 @@ cargo test --all-targets --all-features
   sorted by `client` at the serialization boundary without changing
   the repository structure. Consumers must key by `client`, not row
   index.
-- **Async / concurrent evolutions**: several patterns for scaling
-  beyond a single stream (single-owner MPSC, client-sharded workers,
-  replicated scans, pre-sharded files, per-client actors) were
-  considered but not implemented. See
-  `docs/adr/0004-asynchronous-evolution.md` for the catalog and
-  trade-offs, and `docs/adr/0003-concurrency-model.md` for the two
-  recommended postures.
+- **Async / concurrent evolutions are documented, not implemented**:
+  the first recommended TCP evolution is a bounded MPSC channel feeding a
+  single task that owns the complete `PaymentEngine`. Client-based sharding is
+  a later optimization only if profiling demonstrates that the single owner is
+  a bottleneck. See the dedicated section above,
+  `docs/adr/0004-asynchronous-evolution.md`, and
+  `docs/adr/0003-concurrency-model.md`.
 - **Concurrent DB adapter would need port changes**: today the engine
   reads `transaction_seen` and then commits in two steps. Under
   concurrency, that split races: a unique-constraint conflict would
@@ -198,12 +307,16 @@ cargo test --all-targets --all-features
   optimistic-locking semantics — a port change, not just an adapter
   swap.
 - **Single-threaded synchronous driver**: `process_transactions` consumes
-  a `IntoIterator<Item = Result<Transaction, _>>` so it works for both
-  file streams and any future channel-backed source, but there is no
-  concurrency in the current implementation.
+  an `IntoIterator<Item = Result<Transaction, _>>`, which is appropriate for
+  CSV and other synchronous sources. A future Tokio MPSC adapter would use an
+  asynchronous receive loop and call the same `ProcessTransaction` port; the
+  current helper would not need to pretend that an async receiver is an
+  iterator.
 - **Amount precision**: input and output are normalized to 4 fractional
   digits via `rust_decimal::Decimal`. No floating-point arithmetic ever
   touches balances.
-- **`RejectionReason` is unified** rather than split per operation. This
-  keeps `ApplyOutcome::Rejected(_)` easy to pattern-match and avoids
-  layered `From` conversions in callers.
+- **`RejectionReason` is a unified enum** rather than split per operation.
+  Callers still get a single `ApplyOutcome::Rejected(_)` to match; the
+  mapping from domain errors is done by explicit classifiers so fatal
+  variants (arithmetic overflow) cannot silently downgrade to a
+  rejection.
