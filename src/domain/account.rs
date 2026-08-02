@@ -105,7 +105,6 @@ impl Account {
             .available
             .checked_sub(amount)
             .ok_or_else(|| self.overflow())?;
-        self.ensure_total_representable(new_available, self.held)?;
         self.available = new_available;
         Ok(self)
     }
@@ -123,7 +122,6 @@ impl Account {
             .held
             .checked_add(amount)
             .ok_or_else(|| self.overflow())?;
-        self.ensure_total_representable(new_available, new_held)?;
         self.available = new_available;
         self.held = new_held;
         Ok(self)
@@ -145,7 +143,6 @@ impl Account {
             .held
             .checked_sub(amount)
             .ok_or_else(|| self.overflow())?;
-        self.ensure_total_representable(new_available, new_held)?;
         self.available = new_available;
         self.held = new_held;
         Ok(self)
@@ -163,7 +160,6 @@ impl Account {
             .held
             .checked_sub(amount)
             .ok_or_else(|| self.overflow())?;
-        self.ensure_total_representable(self.available, new_held)?;
         self.held = new_held;
         self.locked = true;
         Ok(self)
